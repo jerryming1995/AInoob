@@ -13,69 +13,9 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 
-# class Ancilayer(tf.keras.layers.Layer):      #暂时先不按层的派生类组织该结构，改用函数组织
-#     def __init__(self, **kwargs):
-#         super(Ancilayer, self).__init__()
-#     def call(self,x):
-#         return self.Ancilayer_op()
-#     def Ancilayer_op(self):
-#         pass
-def Compositeblock(x,units,height,width):
-    # block 的高和宽暂时写死 有需要后面改
-    conv = layers.Conv2D(units, (height, width), padding='SAME', activation="relu")   # 似乎应该使用leakyrelu
-    batchnorm = layers.BatchNormalization()
-    y = batchnorm(conv(x))
-    return  y
-
-def Anciblock(x):
-    y0 = Compositeblock(x,16,7,7)
-    y1 = Compositeblock(y0,16,5,5)
-    y2 = Compositeblock(y0,16,3,3)
-    y = y1 + y2
-    return y
-
-def Denoiser(x_in):
-    temp = Compositeblock(x_in,64,7,7)            #命名以后方便抽出来做 two_stage training
-    temp = Compositeblock(temp,16,1,1)
-    for i in range(4):
-        temp = temp + Anciblock(temp)
-
-    output = layers.Conv2D(2,(3,3),padding="same",activation="sigmoid",name="denoiser_output")(temp) #命名以后方便抽出来做 two_stage training
-    return output
-
-def Encoder(x,feedback_bits):
-    B=4
-    with tf.compat.v1.variable_scope('Encoder'):
-        x_d = Denoiser(x)                 # denoiser 预处理
-        x = Compositeblock(x_d,64,7,7)
-        x = Compositeblock(x, 16, 1, 1)
-
-        x += Anciblock(x)
-
-        x = Compositeblock(x,2,1,1)
-        x = layers.Flatten()(x)                      # 和reshape等价
-        x = layers.Dense(units=int(feedback_bits / B), activation='sigmoid')(x)
-        encoder_output = QuantizationLayer(B)(x)
-    return encoder_output
-
-def Decoder(x,feedback_bits):
-    B=4
-    decoder_input = DeuantizationLayer(B)(x)
-    x = tf.keras.layers.Reshape((-1, int(feedback_bits/B)))(decoder_input)
-    x = layers.Dense(1024, activation='sigmoid')(x)
-    x_ini = layers.Reshape((16, 32, 2))(x)
-    x = Compositeblock(x_ini,16,1,1)
-    for i in range(3):
-        x += Anciblock(x)
-
-    decoder_output = layers.Conv2D(2, 3, padding = 'SAME',activation="sigmoid")(x_ini)
-    return decoder_output
-
-
-
-# Next parts are all referred baseline
 #This part realizes the quantization and dequantization operations.
 #The output of the encoder must be the bitstream.
+
 
 def Num2Bit(Num, B):
     Num_ = Num.numpy()
@@ -152,33 +92,45 @@ class DeuantizationLayer(tf.keras.layers.Layer):
         return base_config
 
 
-# offered by baseline
-# def Encoder(x,feedback_bits):
-#     B=4
-#     with tf.compat.v1.variable_scope('Encoder'):
-#         x = layers.Conv2D(2, 3, padding = 'SAME',activation="relu")(x)
-#         x = layers.Conv2D(2, 3, padding = 'SAME',activation="relu")(x)
-#         x = layers.Flatten()(x)
-#         x = layers.Dense(units=int(feedback_bits/B), activation='sigmoid')(x)
-#         encoder_output = QuantizationLayer(B)(x)
-#     return encoder_output
-# def Decoder(x,feedback_bits):
-#     B=4
-#     decoder_input = DeuantizationLayer(B)(x)
-#     x = tf.keras.layers.Reshape((-1, int(feedback_bits/B)))(decoder_input)
-#     x = layers.Dense(1024, activation='sigmoid')(x)
-#     x_ini = layers.Reshape((16, 32, 2))(x)
-#
-#     for i in range(3):
-#         x = layers.Conv2D(8, 3, padding = 'SAME',activation="relu")(x_ini)
-#         x = layers.Conv2D(16,3, padding = 'SAME',activation="relu")(x)
-#         x = layers.Conv2D(2, 3, padding = 'SAME',activation="relu")(x)
-#         x_ini = keras.layers.Add()([x_ini, x])
-#
-#
-#     decoder_output = layers.Conv2D(2, 3, padding = 'SAME',activation="sigmoid")(x_ini)
-#
-#     return decoder_output
+def Encoder(x,feedback_bits):
+    B=4
+    with tf.compat.v1.variable_scope('Encoder'):
+        # x = layers.Conv2D(2, 3, padding = 'SAME',activation="relu")(x)
+        # x = layers.Conv2D(2, 3, padding = 'SAME',activation="relu")(x)
+        # x = layers.Conv2D(2, 3, padding = 'SAME',activation="relu")(x)
+        # x = layers.Conv2D(2, 3, padding = 'SAME',activation="relu")(x)
+        # x = layers.Conv2D(2, 3, padding = 'SAME',activation="relu")(x)
+        for _ in range(5):
+            x = layers.Conv2D(32, 7, padding = 'SAME',activation="relu")(x)
+        x = layers.Flatten()(x)
+        x = layers.Dense(units=256, activation=None)(x)
+        x = layers.Dense(units=int(feedback_bits/B), activation='sigmoid')(x)
+        encoder_output = QuantizationLayer(B)(x)
+    return encoder_output
+def Decoder(x,feedback_bits):
+    B=4
+    decoder_input = DeuantizationLayer(B)(x)
+    # x = tf.keras.layers.Reshape((-1, int(feedback_bits/B)))(decoder_input) # tf2.3 不能使用，会报错
+    x = tf.reshape(decoder_input, [-1, int(feedback_bits/B)])
+    x = layers.Dense(128, activation='relu')(x)
+    x = layers.Dense(64, activation='relu')(x)
+    x = layers.Dense(1024*16, activation='linear')(x)         ##激活函数是否需要修改看情况
+    x_ini = layers.Reshape((16, 32, 2*16))(x)
+
+    x = layers.Conv2D(32, 7, padding='SAME', activation="relu")(x_ini)
+    x = layers.Conv2D(16, 5, padding='SAME', activation="relu")(x)
+    x = layers.Conv2D(64, 7, padding='SAME', activation="relu")(x)
+    for i in range(5):
+        x = layers.Conv2D(256, 7, padding = 'SAME',activation="relu")(x)
+        x = layers.Conv2D(128,5, padding = 'SAME',activation="relu")(x)
+        x = layers.Conv2D(64, 3, padding = 'SAME',activation="relu")(x)
+        x = layers.Conv2D(32, 3, padding='SAME', activation="relu")(x)
+        x_ini = keras.layers.Add()([x_ini, x])
+
+
+    decoder_output = layers.Conv2D(2, 3, padding = 'SAME',activation="sigmoid")(x_ini)
+
+    return decoder_output
 
 
 def NMSE(x, x_hat):
@@ -201,3 +153,4 @@ def Score(NMSE):
 # can be successfully loaded in test file.
 def get_custom_objects():
     return {"QuantizationLayer":QuantizationLayer,"DeuantizationLayer":DeuantizationLayer}
+    
